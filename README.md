@@ -1,6 +1,5 @@
 
-[ [English](README_EN.md) | 简体中文 ]
-[ English | [简体中文](README.md) ]
+[English](README_EN.md) | [简体中文](README.md)
 
 **特性**
 > 不启动数据库、不连 libpq、不依赖逻辑复制，纯C开发，直接读 WAL 段文件，把数据库中从建表到插入、更新、删除、改类型，完整解析为可执行的 SQL。
