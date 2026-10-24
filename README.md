@@ -13,7 +13,12 @@
 git clone https://github.com/shaohuasong-fang/pg_walex.git
 
 ```
-
+## 快速开始
+```Bash
+cd pg_walex
+make -j$(nproc)
+make install PREFIX=/usr/local
+```
 ---
 
 ## 一、为什么会有"解析WAL 日志文件"这种需求
