@@ -12,7 +12,12 @@
 git clone https://github.com/shaohuasong-fang/pg_walex.git
 
 ```
-
+## Quick Start
+```Bash
+cd pg_walex
+make -j$(nproc)
+make install PREFIX=/usr/local
+```
 ---
 
 ## I. Why is there a need for "parsing WAL log files"
