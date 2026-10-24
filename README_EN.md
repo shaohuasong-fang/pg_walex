@@ -1,3 +1,4 @@
+[English](README_EN.md) | [简体中文](README.md)
 
 **Features**
 > Does not start the database, does not connect to libpq, does not depend on logical replication, developed in pure C, directly reads WAL segment files, and completely parses everything from table creation to inserts, updates, deletes, and type changes in the database into executable SQL.
