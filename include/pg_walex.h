@@ -25,7 +25,7 @@ typedef int16_t int16;
 typedef int32_t int32;
 typedef int64_t int64;
 
-#define PWE_VERSION        "1.0.0"
+#define PWE_VERSION        "1.1.0"
 #define PWE_NAMEDATALEN    64
 #define PWE_MAX_BLOCK_ID   32
 #define PWE_BLCKSZ_DEFAULT 8192
@@ -231,6 +231,7 @@ typedef struct PweSqlOptions
 	bool		tocopy;			/* emit COPY-format data files + manifest */
 	const char *output_dir;		/* directory for --tocopy output */
 	uint32		batch_rows;		/* merge INSERTs into multi-VALUES (0 = off) */
+	bool		rollback;		/* also emit inverse UPDATE/DELETE statements */
 } PweSqlOptions;
 
 typedef struct PweStats
@@ -260,6 +261,8 @@ void		pwe_recon_process(PweReconstructor *rc, PweRecord *rec);
 /* flush unfinished transactions as comments */
 void		pwe_recon_finish(PweReconstructor *rc);
 int			pwe_recon_version(PweReconstructor *rc);
+/* swap the output stream (used by the HTTP monitor to bound memory) */
+void		pwe_recon_set_output(PweReconstructor *rc, FILE *out);
 
 /* JSON/text description of one record (for json/text output modes). */
 void		pwe_record_describe(PweRecord *rec, int version, PweStr *out, bool with_sql);
@@ -275,6 +278,10 @@ typedef struct PweHttpOptions
 	const char *token;
 	const char *default_wal_dir;
 	int			default_version;
+	uint32		default_db_oid;	/* default database OID filter (0 = all) */
+	bool		monitor;		/* follow the WAL directory and keep the
+								 * latest reconstructed statement available
+								 * at /api/v1/item */
 } PweHttpOptions;
 
 int			pwe_http_serve(const PweHttpOptions *opts);

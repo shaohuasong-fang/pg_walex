@@ -9,9 +9,11 @@
 #include <strings.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PWE_HTTP_MAX_REQ (16u * 1024u * 1024u)
@@ -33,6 +35,7 @@ typedef struct PweApiParams
 	bool		logical;
 	bool		aborted;
 	bool		no_crc;
+	bool		rollback;
 	char		pgdata[1024];
 	const char *format;			/* sql | json | stats */
 } PweApiParams;
@@ -43,6 +46,7 @@ params_init(PweApiParams *p, const PweHttpOptions *opts)
 	memset(p, 0, sizeof(*p));
 	p->dir = opts->default_wal_dir;
 	p->version = opts->default_version;
+	p->db_oid = opts->default_db_oid;
 	p->comments = true;
 	p->format = "json";
 }
@@ -164,6 +168,9 @@ params_from_query(PweApiParams *p, const char *query)
 	query_param(query, "logical_messages", buf, sizeof(buf));
 	if (buf[0])
 		p->logical = (strcmp(buf, "0") != 0 && strcmp(buf, "false") != 0);
+	query_param(query, "rollback", buf, sizeof(buf));
+	if (buf[0])
+		p->rollback = (strcmp(buf, "0") != 0 && strcmp(buf, "false") != 0);
 }
 
 /* --- minimal JSON body reader (flat object) ----------------------- */
@@ -303,7 +310,8 @@ params_from_json(PweApiParams *p, const char *body)
 		snprintf(p->pgdata, sizeof(p->pgdata), "%s", buf);
 	if (json_get_str(body, "table", buf, sizeof(buf)) && buf[0])
 	{
-		snprintf(p->table, sizeof(p->table), "%s", buf);
+		snprintf(p->table, sizeof(p->table), "%.*s",
+				 (int) sizeof(p->table) - 1, buf);
 		p->has_table = true;
 	}
 	if (json_get_str(body, "format", buf, sizeof(buf)) && buf[0])
@@ -321,6 +329,8 @@ params_from_json(PweApiParams *p, const char *body)
 		p->non_sql = b;
 	if (json_get_bool(body, "logical_messages", &b))
 		p->logical = b;
+	if (json_get_bool(body, "rollback", &b))
+		p->rollback = b;
 }
 
 /* --- reconstruction ------------------------------------------------- */
@@ -347,6 +357,7 @@ run_reconstruction(PweApiParams *p, FILE *out, PweStats *stats, char *err, size_
 	sopts.include_non_sql = p->non_sql;
 	sopts.include_aborted = p->aborted;
 	sopts.logical_messages = p->logical;
+	sopts.rollback = p->rollback;
 	sopts.only_xid = (uint32) p->xid;
 	sopts.only_database = p->db_oid;
 	sopts.emit_connect = (p->db_oid == 0);
@@ -881,6 +892,327 @@ handle_health(int fd)
 	pwe_str_free(&json);
 }
 
+/* ------------------------------------------------------------------ */
+/* live WAL monitor (--monitor)                                        */
+/*                                                                     */
+/* A background thread keeps scanning the default WAL directory: it    */
+/* rebuilds the catalog once, then re-opens the reader at the last     */
+/* processed LSN every second to pick up newly flushed WAL records.    */
+/* Every completed SQL statement emitted by the reconstructor is       */
+/* captured, so /api/v1/item can always answer with the newest one.    */
+/* ------------------------------------------------------------------ */
+
+typedef struct PweMonitorState
+{
+	pthread_mutex_t lock;
+	PweStr		sql;			/* latest completed statement */
+	uint64		lsn;			/* WAL position at capture time */
+	uint32		xid;
+	time_t		time;
+	bool		have;
+	int			status;			/* 1 = running, -1 = failing */
+	char		last_err[256];
+	uint64		scanned_lsn;	/* current scan position */
+	uint64		nrecords;
+} PweMonitorState;
+
+static PweMonitorState g_monitor;
+static bool g_monitor_enabled = false;
+
+/* accumulates the reconstructor output and extracts whole statements */
+typedef struct PweItemTracker
+{
+	PweStr		line;			/* current (unfinished) output line */
+	PweStr		cur;			/* current (unfinished) statement */
+} PweItemTracker;
+
+static void
+monitor_note_position(uint64 lsn, uint64 nrecords)
+{
+	pthread_mutex_lock(&g_monitor.lock);
+	g_monitor.scanned_lsn = lsn;
+	g_monitor.nrecords = nrecords;
+	pthread_mutex_unlock(&g_monitor.lock);
+}
+
+static void
+monitor_note_error(const char *err)
+{
+	pthread_mutex_lock(&g_monitor.lock);
+	g_monitor.status = -1;
+	snprintf(g_monitor.last_err, sizeof(g_monitor.last_err), "%s",
+			 err ? err : "unknown error");
+	pthread_mutex_unlock(&g_monitor.lock);
+}
+
+static void
+monitor_note_running(void)
+{
+	pthread_mutex_lock(&g_monitor.lock);
+	g_monitor.status = 1;
+	pthread_mutex_unlock(&g_monitor.lock);
+}
+
+static void
+monitor_update_item(const char *sql, size_t len, uint64 lsn, uint32 xid)
+{
+	pthread_mutex_lock(&g_monitor.lock);
+	pwe_str_reset(&g_monitor.sql);
+	while (len > 0 && (sql[len - 1] == '\n' || sql[len - 1] == '\r'))
+		len--;					/* store without the trailing newline */
+	pwe_str_add(&g_monitor.sql, sql, len);
+	g_monitor.lsn = lsn;
+	g_monitor.xid = xid;
+	g_monitor.time = time(NULL);
+	g_monitor.have = true;
+	pthread_mutex_unlock(&g_monitor.lock);
+}
+
+static bool
+line_starts_with(const char *t, const char *prefix)
+{
+	return strncmp(t, prefix, strlen(prefix)) == 0;
+}
+
+/*
+ * Feed freshly written reconstructor output into the tracker.  Lines that
+ * are comments (-- ...) or psql meta commands (\connect) never become part
+ * of a statement; a statement completes when a line ends with ';'.
+ * BEGIN/COMMIT wrappers are not reported as "the latest statement".
+ */
+static void
+tracker_feed(PweItemTracker *tr, const char *data, size_t len,
+			 uint64 lsn, uint32 xid)
+{
+	size_t		i;
+
+	for (i = 0; i < len; i++)
+	{
+		char		c = data[i];
+		const char *t;
+		const char *s;
+		size_t		tlen;
+
+		pwe_str_addc(&tr->line, c);
+		if (c != '\n')
+			continue;
+
+		/* tr->line now holds one full line; trim whitespace for checks */
+		t = tr->line.data;
+		while (*t == ' ' || *t == '\t')
+			t++;
+		tlen = strlen(t);
+		while (tlen > 0 && (t[tlen - 1] == '\n' || t[tlen - 1] == '\r' ||
+							t[tlen - 1] == ' ' || t[tlen - 1] == '\t'))
+			tlen--;
+
+		if (tlen == 0 || line_starts_with(t, "--") || t[0] == '\\')
+		{
+			/* comment / meta line: only keep it if inside a statement */
+			if (tr->cur.len == 0)
+			{
+				pwe_str_reset(&tr->line);
+				continue;
+			}
+		}
+		pwe_str_add(&tr->cur, tr->line.data, tr->line.len);
+		pwe_str_reset(&tr->line);
+
+		if (tlen > 0 && t[tlen - 1] == ';')
+		{
+			/* statement complete */
+			s = tr->cur.data;
+			while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+				s++;
+			if (strcmp(s, "BEGIN;\n") != 0 && strcmp(s, "COMMIT;\n") != 0 &&
+				strcmp(s, "BEGIN;") != 0 && strcmp(s, "COMMIT;") != 0)
+				monitor_update_item(s, strlen(s), lsn, xid);
+			pwe_str_reset(&tr->cur);
+		}
+	}
+}
+
+static void *
+monitor_thread(void *arg)
+{
+	const PweHttpOptions *opts = (const PweHttpOptions *) arg;
+	PweReaderOpts ropts;
+	PweSqlOptions sopts;
+	PweStats	stats;
+	PweItemTracker tr;
+	PweReconstructor *recon = NULL;
+	FILE	   *out = NULL;
+	char	   *buf = NULL;
+	size_t		buflen = 0;
+	size_t		fed = 0;
+	uint64		next_pos = 0;
+	uint64		nrecords = 0;
+	int			version = 0;
+	int			errors = 0;
+	char		pgdata[4096];
+
+	memset(&ropts, 0, sizeof(ropts));
+	memset(&sopts, 0, sizeof(sopts));
+	memset(&stats, 0, sizeof(stats));
+	ropts.wal_dir = opts->default_wal_dir;
+	ropts.version = opts->default_version;
+	ropts.verify_crc = true;
+	sopts.include_comments = false;
+	sopts.only_database = opts->default_db_oid;
+	sopts.emit_connect = (opts->default_db_oid == 0);
+	sopts.max_row_cache = 200000;
+	if (opts->default_wal_dir &&
+		pwe_guess_pgdata(opts->default_wal_dir, pgdata, sizeof(pgdata)))
+		sopts.pgdata = pgdata;
+	pwe_str_init(&tr.line);
+	pwe_str_init(&tr.cur);
+
+	for (;;)
+	{
+		PweReader  *reader;
+		PweRecord	rec;
+		int			rc;
+		char		err[1024];
+
+		ropts.start_lsn = next_pos;
+		memset(err, 0, sizeof(err));
+		reader = pwe_reader_open(&ropts, err, sizeof(err));
+		if (!reader)
+		{
+			monitor_note_error(err);
+			sleep(1);
+			continue;
+		}
+		if (!version)
+			version = pwe_reader_version(reader);
+		if (!recon)
+		{
+			out = open_memstream(&buf, &buflen);
+			if (!out)
+			{
+				monitor_note_error("out of memory");
+				pwe_reader_close(reader);
+				sleep(5);
+				continue;
+			}
+			recon = pwe_recon_create(version, &sopts, out, &stats);
+			fed = 0;
+		}
+		while ((rc = pwe_reader_next(reader, &rec, err, sizeof(err))) == 1)
+		{
+			pwe_recon_process(recon, &rec);
+			if (rec.next_lsn)
+				next_pos = rec.next_lsn;
+			nrecords++;
+			/* capture newly written SQL */
+			fflush(out);
+			if (buflen > fed)
+			{
+				tracker_feed(&tr, buf + fed, buflen - fed,
+							 next_pos, rec.toplevel_xid ? rec.toplevel_xid : rec.xid);
+				fed = buflen;
+			}
+			monitor_note_position(next_pos, nrecords);
+			memset(err, 0, sizeof(err));
+		}
+		pwe_reader_close(reader);
+		if (rc < 0)
+		{
+			/*
+			 * A record split across pages that are not flushed yet, a WAL
+			 * segment switch in progress or recycled segments all surface
+			 * as read errors; retry from the last committed position.
+			 */
+			monitor_note_error(err);
+			if (++errors >= 30)
+			{
+				/* give up on the old position: rebuild from scratch */
+				errors = 0;
+				pwe_recon_free(recon);
+				recon = NULL;
+				fclose(out);
+				free(buf);
+				buf = NULL;
+				buflen = 0;
+				memset(&stats, 0, sizeof(stats));
+				pwe_str_reset(&tr.line);
+				pwe_str_reset(&tr.cur);
+				next_pos = 0;
+			}
+			sleep(1);
+			continue;
+		}
+		if (errors)
+		{
+			pthread_mutex_lock(&g_monitor.lock);
+			g_monitor.last_err[0] = '\0';
+			pthread_mutex_unlock(&g_monitor.lock);
+		}
+		errors = 0;
+		monitor_note_running();
+
+		/* keep the capture buffer bounded */
+		if (buflen > 16u * 1024u * 1024u)
+		{
+			fclose(out);
+			free(buf);
+			buf = NULL;
+			buflen = 0;
+			fed = 0;
+			out = open_memstream(&buf, &buflen);
+			if (out)
+				pwe_recon_set_output(recon, out);
+			else
+				monitor_note_error("out of memory");
+		}
+		sleep(1);
+	}
+	return NULL;
+}
+
+static void
+handle_item(int fd)
+{
+	PweStr		json;
+	char		lbuf[64];
+
+	if (!g_monitor_enabled)
+	{
+		send_error(fd, 400,
+				   "WAL monitoring is not enabled; restart the server with --monitor");
+		return;
+	}
+	pwe_str_init(&json);
+	pthread_mutex_lock(&g_monitor.lock);
+	pwe_str_adds(&json, "{\"monitor\":");
+	pwe_str_adds(&json, g_monitor.status == 1 ? "\"running\"" : "\"error\"");
+	pwe_str_addf(&json, ",\"records_read\":%llu",
+				 (unsigned long long) g_monitor.nrecords);
+	pwe_format_lsn(lbuf, sizeof(lbuf), g_monitor.scanned_lsn);
+	pwe_str_adds(&json, ",\"scanned_lsn\":");
+	pwe_str_add_json(&json, lbuf, strlen(lbuf));
+	if (g_monitor.have)
+	{
+		pwe_str_adds(&json, ",\"lsn\":");
+		pwe_format_lsn(lbuf, sizeof(lbuf), g_monitor.lsn);
+		pwe_str_add_json(&json, lbuf, strlen(lbuf));
+		pwe_str_addf(&json, ",\"xid\":%u,\"time\":%llu,\"sql\":",
+					 g_monitor.xid, (unsigned long long) g_monitor.time);
+		pwe_str_add_json(&json, g_monitor.sql.data, g_monitor.sql.len);
+	}
+	else
+		pwe_str_adds(&json, ",\"lsn\":null,\"xid\":null,\"time\":null,\"sql\":null");
+	if (g_monitor.last_err[0])
+	{
+		pwe_str_adds(&json, ",\"last_error\":");
+		pwe_str_add_json(&json, g_monitor.last_err, strlen(g_monitor.last_err));
+	}
+	pwe_str_addc(&json, '}');
+	pthread_mutex_unlock(&g_monitor.lock);
+	send_json(fd, 200, &json);
+	pwe_str_free(&json);
+}
+
 /* find header value in raw request head */
 static bool
 header_value(const char *req, const char *name, char *out, size_t outlen)
@@ -1033,6 +1365,8 @@ handle_client(int fd, const PweHttpOptions *opts)
 
 	if (strcmp(target, "/api/v1/health") == 0 || strcmp(target, "/health") == 0)
 		handle_health(fd);
+	else if (strcmp(target, "/api/v1/item") == 0)
+		handle_item(fd);
 	else if (strcmp(target, "/api/v1/info") == 0)
 		handle_info(fd, &params);
 	else if (strcmp(target, "/api/v1/wal-files") == 0)
@@ -1045,6 +1379,21 @@ handle_client(int fd, const PweHttpOptions *opts)
 		handle_stats(fd, &params);
 	else if (strcmp(target, "/api/v1/sql") == 0)
 		handle_sql(fd, &params, false);
+	else if (strcmp(target, "/api/v1/rollback") == 0)
+	{
+		/*
+		 * Dedicated inverse-statement endpoint: the parameters are the same
+		 * as /api/v1/sql, but every UPDATE/DELETE is followed by its
+		 * rollback statement (same output as /sql?rollback=1).
+		 */
+		params.rollback = true;
+		if (strcmp(method, "POST") == 0 && body && body[0])
+			handle_sql(fd, &params, true);
+		else if (strcmp(method, "GET") == 0)
+			handle_sql(fd, &params, false);
+		else
+			send_error(fd, 400, "GET or POST with JSON body required");
+	}
 	else if (strcmp(target, "/api/v1/parse") == 0)
 	{
 		if (strcmp(method, "POST") == 0 && body && body[0] &&
@@ -1107,6 +1456,32 @@ pwe_http_serve(const PweHttpOptions *opts)
 			PWE_VERSION, opts->listen ? opts->listen : "127.0.0.1", opts->port);
 	if (opts->default_wal_dir)
 		fprintf(stderr, "pg_walex: default WAL directory: %s\n", opts->default_wal_dir);
+	if (opts->monitor)
+	{
+		if (!opts->default_wal_dir)
+			fprintf(stderr, "pg_walex: --monitor requires a WAL directory (-d)\n");
+		else
+		{
+			pthread_t	tid;
+
+			pthread_mutex_init(&g_monitor.lock, NULL);
+			pwe_str_init(&g_monitor.sql);
+			g_monitor.status = 1;
+			g_monitor_enabled = true;
+			if (pthread_create(&tid, NULL, monitor_thread, (void *) opts) == 0)
+			{
+				pthread_detach(tid);
+				fprintf(stderr, "pg_walex: monitoring %s; latest statement at /api/v1/item\n",
+						opts->default_wal_dir);
+			}
+			else
+			{
+				fprintf(stderr, "pg_walex: cannot start monitor thread: %s\n",
+						strerror(errno));
+				g_monitor_enabled = false;
+			}
+		}
+	}
 	for (;;)
 	{
 		int			cfd = accept(sfd, NULL, NULL);

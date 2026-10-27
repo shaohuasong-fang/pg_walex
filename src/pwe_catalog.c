@@ -249,7 +249,8 @@ pwe_catalog_type_info(PweCatalog *cat, uint32 db, uint32 typid)
 	t = pwe_hash_get(&cat->types, relkey(db, typid));
 	if (t)
 	{
-		strncpy(info.name, t->name, PWE_NAMEDATALEN - 1);
+		memcpy(info.name, t->name, sizeof(info.name) - 1);
+		info.name[sizeof(info.name) - 1] = '\0';
 		info.nsp = t->nsp;
 		info.typlen = t->typlen;
 		info.byval = t->byval;

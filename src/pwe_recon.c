@@ -4,9 +4,13 @@
 #include "pwe_internal.h"
 
 #include <inttypes.h>
+#include <time.h>
 
 #define PWE_HEAP_OPMASK 0x70
 #define PWE_XLOG_HEAP_INIT_PAGE 0x80
+
+static bool copy_is_rewrite_heap(const char *name);
+static bool index_dropped_with_parent(PweTxn *txn, PweRelSnap *snap);
 
 /* per-table COPY output state (--tocopy) */
 typedef struct PweCopyTable
@@ -534,7 +538,8 @@ emit_insert(PweReconstructor *rc, PweTxn *txn, PweRel *rel, PweRowVals *row,
 
 static void
 emit_update(PweReconstructor *rc, PweTxn *txn, PweRel *rel, PweRowVals *newrow,
-			PweRowVals *oldrow, uint32 blkno, uint16 offnum, uint64 lsn)
+			PweRowVals *oldrow, uint32 blkno, uint16 offnum,
+			uint32 new_blkno, uint16 new_offnum, uint64 lsn)
 {
 	PweStr	   *s = &rc->sql;
 	int			i;
@@ -586,6 +591,55 @@ emit_update(PweReconstructor *rc, PweTxn *txn, PweRel *rel, PweRowVals *newrow,
 	txn_add_sql(rc, txn, lsn, s, rel);
 	if (rc->stats)
 		rc->stats->nupdate++;
+	/*
+	 * --rollback: invert the UPDATE by writing the previous value of every
+	 * changed column back.  The row is matched on its post-update values
+	 * (new tuple's ctid), because the old tuple no longer exists.
+	 */
+	if (rc->opts.rollback && oldrow)
+	{
+		bool		rfirst = true;
+		bool		rctid = false;
+
+		pwe_str_reset(s);
+		pwe_str_adds(s, "UPDATE ");
+		qualify_rel(rel, s);
+		pwe_str_adds(s, " SET ");
+		for (i = 1; i <= newrow->natts && i <= rel->natts; i++)
+		{
+			PweAttr    *a;
+
+			if (!rel->attrs)
+				break;
+			a = rel->attrs[i];
+			if (!a || a->dropped || a->generated == 's')
+				continue;
+			if (i > oldrow->natts)
+				continue;
+			{
+				const char *nv = newrow->vals[i] ? newrow->vals[i] : "NULL";
+				const char *ov = oldrow->vals[i] ? oldrow->vals[i] : "NULL";
+
+				if (strcmp(nv, ov) == 0)
+					continue;
+			}
+			if (!rfirst)
+				pwe_str_adds(s, ", ");
+			pwe_str_add_ident(s, a->name);
+			pwe_str_adds(s, " = ");
+			pwe_str_adds(s, oldrow->vals[i] ? oldrow->vals[i] : "NULL");
+			rfirst = false;
+		}
+		if (!rfirst)
+		{
+			add_predicate(rc, rel, newrow, new_blkno, new_offnum, s, &rctid);
+			pwe_str_adds(s, ";\n");
+			txn_add_sql(rc, txn, lsn, s, NULL);
+			if (txn->tail)
+				txn->tail->stmt = PWE_STMT_ROLLBACK;
+		}
+		(void) rctid;
+	}
 }
 
 static void
@@ -605,6 +659,28 @@ emit_delete(PweReconstructor *rc, PweTxn *txn, PweRel *rel, PweRowVals *oldrow,
 	txn_add_sql(rc, txn, lsn, s, rel);
 	if (rc->stats)
 		rc->stats->ndelete++;
+	/*
+	 * --rollback: invert the DELETE by re-inserting the removed row with all
+	 * of its values (only possible when the old tuple was still cached).
+	 */
+	if (rc->opts.rollback && oldrow)
+	{
+		bool		always_id = false;
+
+		pwe_str_reset(s);
+		pwe_str_adds(s, "INSERT INTO ");
+		qualify_rel(rel, s);
+		pwe_str_addc(s, ' ');
+		add_insert_columns(rc, rel, oldrow->natts, s, &always_id);
+		if (always_id)
+			pwe_str_adds(s, " OVERRIDING SYSTEM VALUE");
+		pwe_str_adds(s, " VALUES ");
+		add_insert_values(rel, oldrow, s);
+		pwe_str_adds(s, ";\n");
+		txn_add_sql(rc, txn, lsn, s, NULL);
+		if (txn->tail)
+			txn->tail->stmt = PWE_STMT_ROLLBACK;
+	}
 	(void) used_ctid;
 }
 
@@ -638,10 +714,7 @@ emit_truncate(PweReconstructor *rc, PweTxn *txn, PweRecord *rec)
 		if (i > 0)
 			pwe_str_adds(s, ", ");
 		if (rel)
-		{
 			qualify_rel(rel, s);
-			pwe_rel_clear_rows(rel);
-		}
 		else
 			pwe_str_addf(s, "\"rel_%u\"", relid);
 	}
@@ -655,6 +728,69 @@ emit_truncate(PweReconstructor *rc, PweTxn *txn, PweRecord *rec)
 		txn_add_sql(rc, txn, rec->lsn, s, NULL);
 		if (rc->stats)
 			rc->stats->ntruncate++;
+
+		/*
+		 * --rollback: TRUNCATE does not write the removed rows to WAL, so the
+		 * only source of the old data is the row cache.  Re-insert every row
+		 * we saw for the truncated relations before it is dropped below.
+		 */
+		if (rc->opts.rollback)
+		{
+			PweStr		undo;
+			bool		any = false;
+
+			pwe_str_init(&undo);
+			for (i = 0; i < nrelids; i++)
+			{
+				uint32		relid = pwe_read_u32(p + 12 + i * 4);
+				PweRel	   *rel = pwe_catalog_rel_by_oid(rc->cat, dbid, relid);
+				size_t		b;
+
+				if (!rel || !rel->rows || rel->rows->count == 0)
+					continue;
+				if (rel->persistence == 't' || copy_is_rewrite_heap(rel->name))
+					continue;
+				for (b = 0; b < rel->rows->nbuckets; b++)
+				{
+					PweHashEntry *e;
+
+					for (e = rel->rows->buckets[b]; e; e = e->next)
+					{
+						PweRowVals *row = e->val;
+						bool		always_id = false;
+
+						pwe_str_adds(&undo, "INSERT INTO ");
+						qualify_rel(rel, &undo);
+						pwe_str_addc(&undo, ' ');
+						add_insert_columns(rc, rel, row->natts, &undo,
+										   &always_id);
+						if (always_id)
+							pwe_str_adds(&undo, " OVERRIDING SYSTEM VALUE");
+						pwe_str_adds(&undo, " VALUES ");
+						add_insert_values(rel, row, &undo);
+						pwe_str_adds(&undo, ";\n");
+						any = true;
+					}
+				}
+			}
+			if (any)
+			{
+				txn_add_sql(rc, txn, rec->lsn, &undo, NULL);
+				if (txn->tail)
+					txn->tail->stmt = PWE_STMT_ROLLBACK;
+			}
+			pwe_str_free(&undo);
+		}
+
+		/* the truncated relations have no rows left in the cache */
+		for (i = 0; i < nrelids; i++)
+		{
+			uint32		relid = pwe_read_u32(p + 12 + i * 4);
+			PweRel	   *rel = pwe_catalog_rel_by_oid(rc->cat, dbid, relid);
+
+			if (rel)
+				pwe_rel_clear_rows(rel);
+		}
 	}
 }
 
@@ -715,7 +851,7 @@ static void
 process_multi_insert(PweReconstructor *rc, PweRecord *rec, PweTxn *txn)
 {
 	PweBlock   *blk = &rec->blocks[0];
-	const uint8 *main = rec->main_data;
+	const uint8 *mdata = rec->main_data;
 	uint16		ntuples;
 	bool		isinit = (rec->info & PWE_XLOG_HEAP_INIT_PAGE) != 0;
 	const uint8 *ptr;
@@ -727,7 +863,7 @@ process_multi_insert(PweReconstructor *rc, PweRecord *rec, PweTxn *txn)
 		return;
 	/* struct xl_heap_multi_insert: uint8 flags; uint16 ntuples (2-byte
 	 * aligned, one padding byte); OffsetNumber offsets[]; */
-	ntuples = pwe_read_u16(main + 2);
+	ntuples = pwe_read_u16(mdata + 2);
 	if (!isinit && rec->main_len < 4 + (uint32) ntuples * 2)
 		return;
 	if (txn && txn->db == 0 && blk->db != 0)
@@ -758,7 +894,7 @@ process_multi_insert(PweReconstructor *rc, PweRecord *rec, PweTxn *txn)
 		ptr += 7;
 		if (ptr + datalen > end)
 			return;
-		offnum = isinit ? (uint16) (1 + i) : pwe_read_u16(main + 4 + i * 2);
+		offnum = isinit ? (uint16) (1 + i) : pwe_read_u16(mdata + 4 + i * 2);
 		payload = pwe_malloc(5 + datalen);
 		pwe_write_u16(payload, infomask2);
 		pwe_write_u16(payload + 2, infomask);
@@ -827,7 +963,7 @@ static void
 process_update(PweReconstructor *rc, PweRecord *rec, PweTxn *txn, bool hot)
 {
 	PweBlock   *blk = &rec->blocks[0];
-	const uint8 *main = rec->main_data;
+	const uint8 *mdata = rec->main_data;
 	uint16		old_offnum;
 	uint16		new_offnum;
 	uint8		flags;
@@ -843,9 +979,9 @@ process_update(PweReconstructor *rc, PweRecord *rec, PweTxn *txn, bool hot)
 	(void) hot;
 	if (!blk->in_use || rec->main_len < 14)
 		return;
-	old_offnum = pwe_read_u16(main + 4);
-	flags = main[7];
-	new_offnum = pwe_read_u16(main + 12);
+	old_offnum = pwe_read_u16(mdata + 4);
+	flags = mdata[7];
+	new_offnum = pwe_read_u16(mdata + 12);
 	old_blkno = rec->blocks[1].in_use ? rec->blocks[1].blkno : blk->blkno;
 	if (txn && txn->db == 0 && blk->db != 0)
 		txn->db = blk->db;
@@ -904,7 +1040,7 @@ process_update(PweReconstructor *rc, PweRecord *rec, PweTxn *txn, bool hot)
 
 					row_attach_raw(nrow, rebuilt, rlen);
 					emit_update(rc, txn, rel, nrow, old, old_blkno, old_offnum,
-								rec->lsn);
+								blk->blkno, new_offnum, rec->lsn);
 					removed = pwe_row_remove(rel, old_blkno, old_offnum);
 					if (removed && removed != old)
 						pwe_rowvals_free(removed);
@@ -950,7 +1086,8 @@ process_update(PweReconstructor *rc, PweRecord *rec, PweTxn *txn, bool hot)
 			return;
 		}
 		if (!rc->opts.start_lsn || rec->lsn >= rc->opts.start_lsn)
-			emit_update(rc, txn, rel, newrow, oldrow, old_blkno, old_offnum, rec->lsn);
+			emit_update(rc, txn, rel, newrow, oldrow, old_blkno, old_offnum,
+						blk->blkno, new_offnum, rec->lsn);
 		if (!(flags & 0x0C))
 			row_attach_raw(newrow, data + skip, datalen - skip);
 		pwe_row_set(rel, blk->blkno, new_offnum, newrow);
@@ -1207,13 +1344,77 @@ typedef struct PweDdlCtx
 	PweTxn	   *txn;
 	FILE	   *out;
 	bool	   *begun;
+	const char *hdr_type;		/* type= of the transaction comment */
+	uint64		hdr_lsn;		/* lsn= of the transaction comment */
+	uint64		cur_lsn;		/* LSN of the catalog event being emitted */
 	PweHash		new_rels;		/* relkey -> 1 */
 	PweHash		dropped_rels;
 	PweHash		new_types;
 } PweDdlCtx;
 
+/* classify a reconstructed statement for the `type=` comment field */
+static const char *
+sql_type_name(const char *sql)
+{
+	if (!sql)
+		return "sql";
+	if (strncmp(sql, "INSERT INTO ", 12) == 0)
+		return "insert";
+	if (strncmp(sql, "UPDATE ", 7) == 0)
+		return "update";
+	if (strncmp(sql, "DELETE FROM ", 12) == 0)
+		return "delete";
+	if (strncmp(sql, "TRUNCATE", 8) == 0)
+		return "truncate";
+	if (strncmp(sql, "CREATE ", 7) == 0)
+		return "create";
+	if (strncmp(sql, "ALTER ", 6) == 0)
+		return "alter";
+	if (strncmp(sql, "DROP ", 5) == 0)
+		return "drop";
+	return "sql";
+}
+
+static const char *
+event_type_name(PweEvent *ev)
+{
+	if (ev->stmt == PWE_STMT_ROLLBACK)
+		return "rollback";
+	if (ev->kind == PWE_EV_SQL && ev->sql)
+		return sql_type_name(ev->sql);
+	if (ev->kind == PWE_EV_COPYDATA)
+		return "insert";
+	return NULL;
+}
+
+/* commit timestamp (microseconds since 2000-01-01) -> "YYYY-MM-DD hh:mm:ss.us+00" */
 static void
-ensure_begin(PweReconstructor *rc, PweTxn *txn, FILE *out, bool *begun)
+format_commit_ts(char *buf, size_t buflen, int64 us)
+{
+	int64		unix_us = us + INT64_C(946684800000000);
+	int64		secs = unix_us / INT64_C(1000000);
+	int64		frac = unix_us % INT64_C(1000000);
+	time_t		t = (time_t) secs;
+	struct tm	tm;
+
+	if (frac < 0)
+	{
+		frac += INT64_C(1000000);
+		t -= 1;
+	}
+	if (!gmtime_r(&t, &tm))
+	{
+		snprintf(buf, buflen, "unknown");
+		return;
+	}
+	snprintf(buf, buflen, "%04d-%02d-%02d %02d:%02d:%02d.%06d+00",
+			 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+			 tm.tm_hour, tm.tm_min, tm.tm_sec, (int) frac);
+}
+
+static void
+ensure_begin(PweReconstructor *rc, PweTxn *txn, FILE *out, bool *begun,
+			 const char *type, uint64 lsn)
 {
 	if (*begun)
 		return;
@@ -1229,7 +1430,18 @@ ensure_begin(PweReconstructor *rc, PweTxn *txn, FILE *out, bool *begun)
 		rc->cur_db = txn->db;
 	}
 	if (rc->opts.include_comments)
-		fprintf(out, "-- pg_walex: xid=%u\n", txn->xid);
+	{
+		char		lsnbuf[64];
+		char		tsbuf[64];
+
+		pwe_format_lsn(lsnbuf, sizeof(lsnbuf), lsn ? lsn : txn->commit_lsn);
+		if (txn->has_commit_time)
+			format_commit_ts(tsbuf, sizeof(tsbuf), txn->commit_time);
+		else
+			snprintf(tsbuf, sizeof(tsbuf), "unknown");
+		fprintf(out, "-- pg_walex: type=%s,xid=%u,lsn=%s,timestamp=%s\n",
+				type ? type : "sql", txn->xid, lsnbuf, tsbuf);
+	}
 	fprintf(out, "BEGIN;\n");
 	*begun = true;
 }
@@ -1239,7 +1451,10 @@ emit_ddl_stmt(PweDdlCtx *ctx, PweStr *sql, const char *kind)
 {
 	if (sql->len == 0)
 		return;
-	ensure_begin(ctx->rc, ctx->txn, ctx->out, ctx->begun);
+	if (!ctx->hdr_type)
+		ctx->hdr_type = sql_type_name(pwe_str_cstr(sql));
+	ensure_begin(ctx->rc, ctx->txn, ctx->out, ctx->begun,
+				 ctx->hdr_type, ctx->hdr_lsn);
 	fwrite(sql->data, 1, sql->len, ctx->out);
 	if (sql->data[sql->len - 1] != '\n')
 		fputc('\n', ctx->out);
@@ -1970,7 +2185,10 @@ seed_table_meta(PweDdlCtx *ctx, PweRel *rel)
 
 		if (ct->meta_written)
 			return;
-		ensure_begin(rc, ctx->txn, ctx->out, ctx->begun);
+		if (!ctx->hdr_type)
+			ctx->hdr_type = "create";
+		ensure_begin(rc, ctx->txn, ctx->out, ctx->begun,
+					 ctx->hdr_type, ctx->hdr_lsn);
 		copy_write_meta(rc, ct, rel);
 		return;
 	}
@@ -1983,7 +2201,10 @@ seed_table_meta(PweDdlCtx *ctx, PweRel *rel)
 		pwe_str_free(&sql);
 		return;
 	}
-	ensure_begin(rc, ctx->txn, ctx->out, ctx->begun);
+	if (!ctx->hdr_type)
+		ctx->hdr_type = "create";
+	ensure_begin(rc, ctx->txn, ctx->out, ctx->begun,
+				 ctx->hdr_type, ctx->hdr_lsn);
 	seed_schema_now(rc, rel->db, rel->nsp);
 	obj_name_claim(rc, rel->db, rel->nsp, rel->name, rel->oid);
 	pwe_hash_put(&rc->seed_rels, key, (void *) 1);
@@ -2132,6 +2353,8 @@ copy_handle_create_table(PweDdlCtx *ctx, PweRelSnap *snap)
 	pwe_str_init(&line);
 	pwe_str_addf(&line, "-- pg_walex: CREATE TABLE %s (see %s.meta.sql)\n",
 				 ct->base, ct->base);
+	if (!ctx->hdr_type)
+		ctx->hdr_type = "create";
 	emit_ddl_stmt(ctx, &line, "CREATE TABLE");
 	pwe_str_free(&line);
 }
@@ -2538,7 +2761,7 @@ emit_drop_column(PweDdlCtx *ctx, PweAttrSnap *as)
 	pwe_str_free(&sql);
 }
 
-static void
+static bool
 emit_drop_relation(PweDdlCtx *ctx, PweRelSnap *snap)
 {
 	PweReconstructor *rc = ctx->rc;
@@ -2546,14 +2769,14 @@ emit_drop_relation(PweDdlCtx *ctx, PweRelSnap *snap)
 	const char *kind = NULL;
 
 	if (snap->persistence == 't')
-		return;
+		return false;
 	/*
 	 * Rewrite heaps (pg_temp_NNN) created by ALTER TABLE ... TYPE are transient
 	 * internal relations: no CREATE is emitted for them, so dropping them would
 	 * only cause a replay error.
 	 */
 	if (copy_is_rewrite_heap(snap->name))
-		return;
+		return false;
 	/*
 	 * Toast indexes are internal objects that disappear together with their
 	 * table; they are never created explicitly, so dropping them by name would
@@ -2564,8 +2787,15 @@ emit_drop_relation(PweDdlCtx *ctx, PweRelSnap *snap)
 		const char *ns = pwe_catalog_ns_name(rc->cat, snap->db, snap->nsp);
 
 		if (ns && strcmp(ns, "pg_toast") == 0)
-			return;
+			return false;
 	}
+	/*
+	 * An index that goes away with its table or its constraint is not dropped
+	 * by name: "DROP INDEX" would fail on a constraint index and the index no
+	 * longer exists after "DROP TABLE".
+	 */
+	if (snap->relkind == 'i' && index_dropped_with_parent(ctx->txn, snap))
+		return false;
 	/*
 	 * In replay-oriented modes only objects created by this replay can (and
 	 * need to) be dropped.  Everything else is a cascade pg_class row of an
@@ -2578,14 +2808,14 @@ emit_drop_relation(PweDdlCtx *ctx, PweRelSnap *snap)
 		uint64		key = ((uint64) snap->db << 32) | snap->oid;
 
 		if (pwe_hash_get(&rc->dropped_objs, key))
-			return;
+			return false;
 		/*
 		 * Only the object that currently owns the name can be dropped; a
 		 * stale pg_class delete (the old incarnation was already replaced by
 		 * a colliding CREATE) must not remove its successor.
 		 */
 		if (!obj_name_owned(rc, snap->db, snap->nsp, snap->name, snap->oid))
-			return;
+			return false;
 		pwe_hash_put(&rc->dropped_objs, key, (void *) 1);
 	}
 	switch (snap->relkind)
@@ -2616,13 +2846,275 @@ emit_drop_relation(PweDdlCtx *ctx, PweRelSnap *snap)
 			kind = "DROP FOREIGN TABLE ";
 			break;
 		default:
-			return;
+			return false;
 	}
 	pwe_str_init(&sql);
 	pwe_str_adds(&sql, kind);
 	qualify_snap(rc, snap, &sql);
 	pwe_str_adds(&sql, ";\n");
 	emit_ddl_stmt(ctx, &sql, kind);
+	pwe_str_free(&sql);
+	return true;
+}
+
+/*
+ * An index that disappears together with its table or its constraint must not
+ * be dropped by name: PostgreSQL rejects "DROP INDEX" for a constraint index,
+ * and after "DROP TABLE" the index no longer exists.  Both cases show up as a
+ * pg_index / pg_constraint delete in the same transaction.
+ */
+static bool
+index_dropped_with_parent(PweTxn *txn, PweRelSnap *snap)
+{
+	PweEvent   *ev;
+	uint32		parent = 0;
+
+	if (!txn)
+		return false;
+	for (ev = txn->events; ev; ev = ev->next)
+	{
+		PweCatPayload *p = ev->cat;
+
+		if (!p || p->op != PWE_OP_DELETE)
+			continue;
+		if (p->cat == PWE_CAT_PG_CONSTRAINT && p->o.con.db == snap->db &&
+			p->o.con.indid == snap->oid)
+			return true;
+		if (p->cat == PWE_CAT_PG_INDEX && p->o.idx.db == snap->db &&
+			p->o.idx.oid == snap->oid)
+			parent = p->o.idx.relid;
+	}
+	if (parent)
+	{
+		for (ev = txn->events; ev; ev = ev->next)
+		{
+			PweCatPayload *p = ev->cat;
+
+			if (p && p->cat == PWE_CAT_PG_CLASS && p->op == PWE_OP_DELETE &&
+				p->o.rel.db == snap->db && p->o.rel.oid == parent)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Column definitions of a table that is being dropped.  pg_attribute rows are
+ * deleted before the pg_class row, so by the time the table is detached its
+ * attribute array is already empty; the delete events themselves still carry
+ * the old attribute snapshots.
+ */
+typedef struct PweDropAttrs
+{
+	PweAttrSnap *attrs[1600];
+	int			n;
+	PweConSnap *pk;
+} PweDropAttrs;
+
+static int
+drop_attr_cmp(const void *a, const void *b)
+{
+	const PweAttrSnap *x = *(const PweAttrSnap *const *) a;
+	const PweAttrSnap *y = *(const PweAttrSnap *const *) b;
+
+	return (int) x->num - (int) y->num;
+}
+
+static void
+collect_drop_attrs(PweTxn *txn, uint32 db, uint32 relid, PweDropAttrs *out)
+{
+	PweEvent   *ev;
+
+	memset(out, 0, sizeof(*out));
+	if (!txn)
+		return;
+	for (ev = txn->events; ev; ev = ev->next)
+	{
+		PweCatPayload *p = ev->cat;
+
+		if (!p || p->op != PWE_OP_DELETE)
+			continue;
+		if (p->cat == PWE_CAT_PG_ATTRIBUTE && p->o.attr.db == db &&
+			p->o.attr.relid == relid && p->o.attr.num > 0 &&
+			!p->o.attr.dropped)
+		{
+			if (out->n < (int) (sizeof(out->attrs) / sizeof(out->attrs[0])))
+				out->attrs[out->n++] = &p->o.attr;
+		}
+		else if (p->cat == PWE_CAT_PG_CONSTRAINT && p->o.con.db == db &&
+				 p->o.con.relid == relid && p->o.con.contype == 'p' &&
+				 p->o.con.nkeys > 0)
+			out->pk = &p->o.con;
+	}
+	if (out->n > 1)
+		qsort(out->attrs, (size_t) out->n, sizeof(out->attrs[0]), drop_attr_cmp);
+}
+
+static PweAttrSnap *
+find_drop_attr(PweDropAttrs *attrs, int16 num)
+{
+	int			i;
+
+	for (i = 0; i < attrs->n; i++)
+		if (attrs->attrs[i]->num == num)
+			return attrs->attrs[i];
+	return NULL;
+}
+
+/* INSERT column list built from the collected attribute snapshots */
+static void
+drop_insert_columns(PweDropAttrs *attrs, PweStr *out, bool *always_id)
+{
+	int			i;
+	bool		first = true;
+
+	pwe_str_addc(out, '(');
+	for (i = 0; i < attrs->n; i++)
+	{
+		PweAttrSnap *a = attrs->attrs[i];
+
+		if (a->generated == 's')
+			continue;
+		if (!first)
+			pwe_str_adds(out, ", ");
+		pwe_str_add_ident(out, a->name);
+		first = false;
+		if (a->identity == 'a')
+			*always_id = true;
+	}
+	pwe_str_addc(out, ')');
+}
+
+static void
+drop_insert_values(PweDropAttrs *attrs, PweRowVals *row, PweStr *out)
+{
+	int			i;
+	bool		first = true;
+
+	pwe_str_addc(out, '(');
+	for (i = 0; i < attrs->n; i++)
+	{
+		PweAttrSnap *a = attrs->attrs[i];
+
+		if (a->generated == 's')
+			continue;
+		if (!first)
+			pwe_str_adds(out, ", ");
+		if (a->num > 0 && a->num <= row->natts && row->vals[a->num])
+			pwe_str_adds(out, row->vals[a->num]);
+		else
+			pwe_str_adds(out, "NULL");
+		first = false;
+	}
+	pwe_str_addc(out, ')');
+}
+
+/*
+ * Render "CREATE TABLE" for a table that is about to be dropped.  Column
+ * definitions come from the pg_attribute delete events, falling back to the
+ * detached relation when those are not in the read range.
+ */
+static bool
+render_create_table_from_drop(PweReconstructor *rc, PweRel *rel,
+							  PweDropAttrs *attrs, PweStr *sql)
+{
+	int			i;
+
+	if (attrs->n == 0)
+		return false;
+	pwe_str_adds(sql, "CREATE ");
+	if (rel->persistence == 'u')
+		pwe_str_adds(sql, "UNLOGGED ");
+	pwe_str_adds(sql, "TABLE ");
+	qualify_rel(rel, sql);
+	pwe_str_adds(sql, " (\n");
+	for (i = 0; i < attrs->n; i++)
+	{
+		PweAttrSnap *a = attrs->attrs[i];
+
+		if (i > 0)
+			pwe_str_adds(sql, ",\n");
+		pwe_str_adds(sql, "  ");
+		pwe_str_add_ident(sql, a->name);
+		pwe_str_addc(sql, ' ');
+		add_type_with_mod(rc, rel->db, a->typid, a->typmod, sql);
+		if (a->notnull)
+			pwe_str_adds(sql, " NOT NULL");
+	}
+	if (attrs->pk)
+	{
+		pwe_str_adds(sql, ",\n  PRIMARY KEY (");
+		for (i = 0; i < attrs->pk->nkeys && i < 32; i++)
+		{
+			PweAttrSnap *a = find_drop_attr(attrs, attrs->pk->keys[i]);
+
+			if (i > 0)
+				pwe_str_adds(sql, ", ");
+			if (a)
+				pwe_str_add_ident(sql, a->name);
+			else
+				pwe_str_addf(sql, "att%d", attrs->pk->keys[i]);
+		}
+		pwe_str_addc(sql, ')');
+	}
+	pwe_str_adds(sql, "\n);\n");
+	return true;
+}
+
+/*
+ * --rollback for DROP TABLE: recreate the table from the catalog snapshots
+ * carried by the delete events and re-insert every row still held in the row
+ * cache.  Only what is available is restored (definition + rows seen in the
+ * WAL window); secondary indexes are not recreated.
+ */
+static void
+emit_drop_rollback(PweDdlCtx *ctx, PweCatPayload *p)
+{
+	PweReconstructor *rc = ctx->rc;
+	PweRel	   *rel = (PweRel *) p->saved_rel;
+	PweDropAttrs attrs;
+	PweStr		sql;
+	size_t		b;
+
+	if (!rc->opts.rollback || !rel)
+		return;
+	if (!(rel->relkind == 'r' || rel->relkind == 'p' || rel->relkind == 'f'))
+		return;
+	if (rel->persistence == 't' || copy_is_rewrite_heap(rel->name))
+		return;
+	collect_drop_attrs(ctx->txn, p->o.rel.db, p->o.rel.oid, &attrs);
+	pwe_str_init(&sql);
+	if (!render_create_table_from_drop(rc, rel, &attrs, &sql))
+	{
+		pwe_str_free(&sql);
+		return;
+	}
+	if (rel->rows)
+	{
+		for (b = 0; b < rel->rows->nbuckets; b++)
+		{
+			PweHashEntry *e;
+
+			for (e = rel->rows->buckets[b]; e; e = e->next)
+			{
+				PweRowVals *row = e->val;
+				bool		always_id = false;
+
+				pwe_str_adds(&sql, "INSERT INTO ");
+				qualify_rel(rel, &sql);
+				pwe_str_addc(&sql, ' ');
+				drop_insert_columns(&attrs, &sql, &always_id);
+				if (always_id)
+					pwe_str_adds(&sql, " OVERRIDING SYSTEM VALUE");
+				pwe_str_adds(&sql, " VALUES ");
+				drop_insert_values(&attrs, row, &sql);
+				pwe_str_adds(&sql, ";\n");
+			}
+		}
+	}
+	txn_add_sql(rc, ctx->txn, ctx->cur_lsn, &sql, NULL);
+	if (ctx->txn->tail)
+		ctx->txn->tail->stmt = PWE_STMT_ROLLBACK;
 	pwe_str_free(&sql);
 }
 
@@ -2870,8 +3362,8 @@ emit_catalog_event(PweDdlCtx *ctx, PweCatPayload *p)
 					}
 				}
 			}
-			else
-				emit_drop_relation(ctx, &p->o.rel);
+			else if (emit_drop_relation(ctx, &p->o.rel))
+				emit_drop_rollback(ctx, p);
 			break;
 		case PWE_CAT_PG_INDEX:
 			if (p->op == PWE_OP_INSERT)
@@ -3073,9 +3565,27 @@ emit_transaction(PweReconstructor *rc, PweTxn *txn)
 	ctx.txn = txn;
 	ctx.out = rc->out;
 	ctx.begun = &begun;
+	ctx.hdr_type = NULL;			/* resolved from the first emitted statement */
+	ctx.hdr_lsn = 0;
 	pwe_hash_init(&ctx.new_rels);
 	pwe_hash_init(&ctx.dropped_rels);
 	pwe_hash_init(&ctx.new_types);
+	/*
+	 * The transaction comment describes the first emitted statement: its
+	 * type (derived from the generated SQL) and the LSN of the WAL record
+	 * that produced it.
+	 */
+	for (ev = txn->events; ev; ev = ev->next)
+	{
+		if (rc->opts.start_lsn && ev->lsn < rc->opts.start_lsn)
+			continue;
+		if (ev->kind == PWE_EV_SQL || ev->kind == PWE_EV_COPYDATA || ev->cat)
+		{
+			ctx.hdr_lsn = ev->lsn;
+			ctx.hdr_type = event_type_name(ev);
+			break;
+		}
+	}
 	for (ev = txn->events; ev; ev = ev->next)
 	{
 		if (rc->opts.start_lsn && ev->lsn < rc->opts.start_lsn)
@@ -3110,9 +3620,36 @@ emit_transaction(PweReconstructor *rc, PweTxn *txn)
 		}
 		if (rc->opts.tocopy)
 			copy_flush_segments(rc);	/* data precedes this statement */
+		if (ev->kind == PWE_EV_SQL && ev->stmt == PWE_STMT_ROLLBACK)
+		{
+			char		lsnbuf[64];
+			char		tsbuf[64];
+
+			/* inverse statement: its own comment, never batched/copied */
+			batch_flush(rc, &pend, &pend_open);
+			pend_rel = 0;
+			ensure_begin(rc, txn, rc->out, &begun, ctx.hdr_type, ctx.hdr_lsn);
+			if (rc->opts.include_comments)
+			{
+				pwe_format_lsn(lsnbuf, sizeof(lsnbuf), ev->lsn);
+				if (txn->has_commit_time)
+					format_commit_ts(tsbuf, sizeof(tsbuf), txn->commit_time);
+				else
+					snprintf(tsbuf, sizeof(tsbuf), "unknown");
+				fprintf(rc->out, "-- pg_walex: rollback,xid=%u,lsn=%s,timestamp=%s\n",
+						txn->xid, lsnbuf, tsbuf);
+			}
+			if (ev->sql)
+				fputs(ev->sql, rc->out);
+			if (rc->stats)
+				rc->stats->nsql++;
+			continue;
+		}
 		if (ev->kind == PWE_EV_SQL)
 		{
-			ensure_begin(rc, txn, rc->out, &begun);
+			if (!ctx.hdr_type)
+				ctx.hdr_type = sql_type_name(ev->sql);
+			ensure_begin(rc, txn, rc->out, &begun, ctx.hdr_type, ctx.hdr_lsn);
 			if (ev->relkey && (rc->opts.tocopy || rc->opts.batch_rows > 0))
 			{
 				PweRel	   *srel = pwe_catalog_rel_by_oid(rc->cat,
@@ -3154,6 +3691,7 @@ emit_transaction(PweReconstructor *rc, PweTxn *txn)
 		{
 			batch_flush(rc, &pend, &pend_open);
 			pend_rel = 0;
+			ctx.cur_lsn = ev->lsn;
 			emit_catalog_event(&ctx, ev->cat);
 		}
 	}
@@ -3395,6 +3933,13 @@ pwe_recon_version(PweReconstructor *rc)
 	return rc->version;
 }
 
+void
+pwe_recon_set_output(PweReconstructor *rc, FILE *out)
+{
+	if (out)
+		rc->out = out;
+}
+
 PweCatalog *
 pwe_recon_catalog(PweReconstructor *rc)
 {
@@ -3432,6 +3977,17 @@ pwe_recon_process(PweReconstructor *rc, PweRecord *rec)
 		{
 			if (txn)
 			{
+				/*
+				 * xl_xact_commit starts with xact_time (microseconds since
+				 * 2000-01-01).  Prepare records carry no such timestamp.
+				 */
+				txn->commit_lsn = rec->lsn;
+				if ((op == 0x00 || op == 0x30) && rec->main_data &&
+					rec->main_len >= 8)
+				{
+					txn->commit_time = (int64) pwe_read_u64(rec->main_data);
+					txn->has_commit_time = true;
+				}
 				emit_transaction(rc, txn);
 				pwe_hash_remove(&rc->txns, txn->xid);
 				free_txn(rc, txn);

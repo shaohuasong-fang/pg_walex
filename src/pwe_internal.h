@@ -421,6 +421,20 @@ enum
 	PWE_OP_DELETE
 };
 
+/* statement classification used by the SQL comment header */
+enum
+{
+	PWE_STMT_UNKNOWN = 0,
+	PWE_STMT_INSERT,
+	PWE_STMT_UPDATE,
+	PWE_STMT_DELETE,
+	PWE_STMT_TRUNCATE,
+	PWE_STMT_CREATE,
+	PWE_STMT_ALTER,
+	PWE_STMT_DROP,
+	PWE_STMT_ROLLBACK
+};
+
 typedef struct PweCatPayload
 {
 	int			cat;
@@ -458,6 +472,7 @@ struct PweEvent
 	uint64		lsn;
 	uint32		xid;
 	uint8		kind;
+	uint8		stmt;			/* PWE_STMT_* classification */
 	uint16		nfields;		/* PWE_EV_COPYDATA: field count of the line */
 	uint64		relkey;			/* PWE_EV_COPYDATA: (db<<32)|reloid */
 	char	   *collist;		/* PWE_EV_COPYDATA: "(c1, c2)" at decode time */
@@ -470,6 +485,9 @@ struct PweTxn
 	uint32		xid;
 	uint32		db;
 	uint64		first_lsn;
+	uint64		commit_lsn;		/* LSN of the commit/abort record */
+	int64		commit_time;	/* commit timestamp (us since 2000-01-01) */
+	bool		has_commit_time;
 	PweEvent  *events;
 	PweEvent  *tail;
 	uint64		bytes;

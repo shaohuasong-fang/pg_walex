@@ -1,11 +1,12 @@
 # pg_walex - PostgreSQL WAL Extractor: offline WAL reader and SQL reconstructor
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-CFLAGS  += -std=c11 -Wall -Wextra -Wno-unused-parameter \
+CFLAGS  += -std=c11 -Wall -Wextra -Wno-unused-parameter -pthread \
            -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
            -Iinclude -Isrc
 LDFLAGS ?=
 LDLIBS  ?=
+LDLIBS  += -pthread
 
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
@@ -18,8 +19,16 @@ BIN = pg_walex
 
 # Optional compression libraries (only used for WAL full-page images /
 # toasted values that were compressed with LZ4 or Zstandard).
+# Homebrew leaves its headers/libs outside the default search path, so add
+# them only on macOS; on Linux the system paths are already searched.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
 EXTRA_INC = -I/opt/homebrew/include -I/usr/local/include
 EXTRA_LIB = -L/opt/homebrew/lib -L/usr/local/lib
+else
+EXTRA_INC =
+EXTRA_LIB =
+endif
 
 HAVE_LZ4 := $(shell printf '\#include <lz4.h>\nint main(void){return 0;}\n' | \
               $(CC) $(EXTRA_INC) -x c - -o /dev/null $(EXTRA_LIB) -llz4 >/dev/null 2>&1 && echo yes)

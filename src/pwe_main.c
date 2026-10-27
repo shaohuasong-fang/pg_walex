@@ -34,6 +34,8 @@ usage(FILE *out)
 			"                          (output directory from -o, default ./pg_walex_copy)\n"
 			"      --batch-inserts[=N] merge consecutive INSERTs of one table into a\n"
 			"                          single multi-VALUES statement (default N=100)\n"
+			"      --rollback          also emit the inverse statement for every\n"
+			"                          UPDATE/DELETE (commented as rollback)\n"
 			"  -l, --limit N           stop after N WAL records\n"
 			"      --xid N             only emit the given transaction\n"
 			"      --table NAME        only emit DML for NAME ([schema.]table)\n"
@@ -49,6 +51,9 @@ usage(FILE *out)
 			"      --no-connect        do not emit psql \\connect between databases\n"
 			"      --max-rows N        row cache size for ctid->row tracking (default 200000)\n"
 			"      --serve             run the RESTful API server\n"
+			"      --monitor           with --serve: follow the WAL directory in the\n"
+			"                          background and expose the latest reconstructed\n"
+			"                          SQL statement at /api/v1/item\n"
 			"      --listen ADDR       listen address (default 127.0.0.1)\n"
 			"      --port N            listen port (default 8900)\n"
 			"      --token TOKEN       require Bearer TOKEN for API requests\n"
@@ -56,9 +61,12 @@ usage(FILE *out)
 			"      --version           print version and exit\n"
 			"  -h, --help              show this help\n\n"
 			"Examples:\n"
-			"  pg_walex --pg-version 17 /data/17/pg_wal > changes.sql\n"
-			"  pg_walex -F json --start-lsn 0/16B2C60 /data/17/pg_wal\n"
-			"  pg_walex --serve --port 8900 --dir /data/17/pg_wal\n");
+			"  pg_walex --pg-version version_num waldirectory > changes.sql\n"
+			"  pg_walex -F json --start-lsn 0/16B2C60 waldirectory\n"
+			"  pg_walex --serve --port 8900 --dir waldirectory\n"
+                        "Comments:\n"
+                        " valid version_num is : 11,12,13,14,15,16,17,18\n"
+                        " waldirectory: <pgdata directory>/pg_wal\n");
 }
 
 static int
@@ -111,6 +119,8 @@ main(int argc, char **argv)
 		{"no-pgdata", no_argument, NULL, 1018},
 		{"tocopy", no_argument, NULL, 1020},
 		{"batch-inserts", optional_argument, NULL, 1021},
+		{"monitor", no_argument, NULL, 1022},
+		{"rollback", no_argument, NULL, 1023},
 		{"verbose", no_argument, NULL, 'v'},
 		{"version", no_argument, NULL, 1013},
 		{"help", no_argument, NULL, 'h'},
@@ -308,6 +318,7 @@ main(int argc, char **argv)
 						return 2;
 					}
 					db_filter = (uint32) v;
+					hopts.default_db_oid = (uint32) v;
 				}
 				break;
 			case 1015:
@@ -339,6 +350,12 @@ main(int argc, char **argv)
 				}
 				else
 					sopts.batch_rows = 100;
+				break;
+			case 1022:
+				hopts.monitor = true;
+				break;
+			case 1023:
+				sopts.rollback = true;
 				break;
 			case 'v':
 				verbose = true;
