@@ -3,7 +3,8 @@ CC      ?= cc
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=c11 -Wall -Wextra -Wno-unused-parameter -pthread \
            -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
-           -Iinclude -Isrc
+           -Iinclude -Isrc \
+           -MMD -MP
 LDFLAGS ?=
 LDLIBS  ?=
 LDLIBS  += -pthread
@@ -15,6 +16,7 @@ SRC = src/pwe_util.c src/pwe_version.c src/pwe_wal.c src/pwe_tuple.c \
       src/pwe_catalog.c src/pwe_recon.c src/pwe_output.c src/pwe_main.c \
       src/pwe_http.c
 OBJ = $(SRC:.c=.o)
+DEP = $(OBJ:.o=.d)
 BIN = pg_walex
 
 # Optional compression libraries (only used for WAL full-page images /
@@ -54,14 +56,17 @@ $(BIN): $(OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+-include $(DEP)
+
 install: $(BIN)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
 
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
+
 clean:
-	rm -f $(OBJ) $(BIN)
+	rm -f $(OBJ) $(DEP) $(BIN)
 
-test: $(BIN)
-	./tests/run_local.sh
 
-.PHONY: all install clean test
+.PHONY: all install uninstall clean
