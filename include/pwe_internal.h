@@ -1,4 +1,11 @@
 /*
+ * pg_walex - PostgreSQL WAL parsing and recovery tool
+ * Copyright (C) 2026 songshaohua <developerhonor@petalmail.com>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+/*
  * pg_walex - internal shared declarations (not installed)
  */
 #ifndef PWE_INTERNAL_H

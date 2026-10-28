@@ -1,4 +1,4 @@
-# pg_walex - PostgreSQL WAL Extractor: offline WAL reader and SQL reconstructor
+# pg_walex - PostgreSQL WAL Extractor:  WAL reader and SQL reconstructor
 CC      ?= cc
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=c11 -Wall -Wextra -Wno-unused-parameter -pthread \
@@ -47,7 +47,6 @@ CFLAGS  += -DPWE_WITH_ZSTD $(EXTRA_INC)
 LDFLAGS += $(EXTRA_LIB)
 LDLIBS  += -lzstd
 endif
-
 all: $(BIN)
 
 $(BIN): $(OBJ)

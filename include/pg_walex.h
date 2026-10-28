@@ -1,7 +1,14 @@
 /*
+ * pg_walex - PostgreSQL WAL parsing and recovery tool
+ * Copyright (C) 2026 songshaohua <developerhonor@petalmail.com>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+/*
  * pg_walex - PostgreSQL WAL deep reader / SQL reconstructor
  *
- * Reads PostgreSQL 11..18 WAL segment files directly (no server, no catalog
+ * Reads PostgreSQL 9.6..19 WAL segment files directly (no server, no catalog
  * files), reconstructs catalog state and transactions from WAL, and renders
  * the changes as portable SQL text.  Also provides a small RESTful API.
  */
@@ -25,7 +32,7 @@ typedef int16_t int16;
 typedef int32_t int32;
 typedef int64_t int64;
 
-#define PWE_VERSION        "1.1.0"
+#define PWE_VERSION        "1.2.0"
 #define PWE_NAMEDATALEN    64
 #define PWE_MAX_BLOCK_ID   32
 #define PWE_BLCKSZ_DEFAULT 8192
@@ -39,7 +46,7 @@ typedef int64_t int64;
 /* ------------------------------------------------------------------ */
 typedef struct PweVersionInfo
 {
-	int			major;			/* 11 .. 18 */
+	int			major;			/* 9 .. 19 */
 	uint16		page_magic;
 	bool		catalog_has_oid;	/* explicit oid attribute in catalogs */
 } PweVersionInfo;

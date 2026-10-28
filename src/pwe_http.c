@@ -1,4 +1,22 @@
 /*
+ * pg_walex - PostgreSQL WAL parsing and recovery tool
+ * Copyright (C) 2026 songshaohua <developerhonor@petalmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
  * pg_walex - embedded RESTful API server
  */
 #include "pwe_internal.h"
@@ -122,7 +140,7 @@ params_from_query(PweApiParams *p, const char *query)
 	{
 		int64		v;
 
-		if (pwe_parse_int(buf, &v) && v >= 11 && v <= 18)
+		if (pwe_parse_int(buf, &v) && v >= 9 && v <= 19)
 			p->version = (int) v;
 	}
 	query_param(query, "start_lsn", buf, sizeof(buf));
@@ -290,10 +308,10 @@ params_from_json(PweApiParams *p, const char *body)
 	{
 		int64		v;
 
-		if (pwe_parse_int(buf, &v) && v >= 11 && v <= 18)
+		if (pwe_parse_int(buf, &v) && v >= 9 && v <= 19)
 			p->version = (int) v;
 	}
-	else if (json_get_uint(body, "version", &u) && u >= 11 && u <= 18)
+	else if (json_get_uint(body, "version", &u) && u >= 9 && u <= 19)
 		p->version = (int) u;
 	if (json_get_uint(body, "start_lsn", &u))
 		p->start_lsn = u;
@@ -883,7 +901,7 @@ handle_health(int fd)
 
 	pwe_str_init(&json);
 	pwe_str_adds(&json, "{\"status\":\"ok\",\"tool\":\"pg_walex\",\"version\":\"" PWE_VERSION "\","
-				 "\"postgres_versions\":[11,12,13,14,15,16,17,18],\"pglz\":true,\"lz4\":");
+				 "\"postgres_versions\":[9,10,11,12,13,14,15,16,17,18,19],\"pglz\":true,\"lz4\":");
 	pwe_str_adds(&json, pwe_lz4_available() ? "true" : "false");
 	pwe_str_adds(&json, ",\"zstd\":");
 	pwe_str_adds(&json, pwe_zstd_available() ? "true" : "false");

@@ -1,8 +1,26 @@
 /*
+ * pg_walex - PostgreSQL WAL parsing and recovery tool
+ * Copyright (C) 2026 songshaohua <developerhonor@petalmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
  * pg_walex - PostgreSQL WAL segment / record reader
  *
  * Independent re-implementation of the relevant parts of xlogreader.c,
- * supporting the on-disk formats of PostgreSQL 11 through 18.
+ * supporting the on-disk formats of PostgreSQL 9.6 through 19.
  */
 #include "pwe_internal.h"
 
@@ -285,7 +303,7 @@ pwe_reader_open(const PweReaderOpts *opts, char *err, size_t errlen)
 
 			if (!want)
 			{
-				snprintf(err, errlen, "unsupported PostgreSQL version %d (expected 11..18)",
+				snprintf(err, errlen, "unsupported PostgreSQL version %d (expected 9..19)",
 						 opts->version);
 				goto fail;
 			}
@@ -298,7 +316,7 @@ pwe_reader_open(const PweReaderOpts *opts, char *err, size_t errlen)
 		else
 		{
 			snprintf(err, errlen,
-					 "unknown WAL page magic 0x%04X; use --version to force a major version",
+					 "unknown WAL page magic 0x%04X; use --pg-version to force a major version",
 					 magic);
 			goto fail;
 		}
@@ -535,7 +553,13 @@ decode_block_headers(PweReader *r, PweRecord *rec, char *err, size_t errlen)
 				blk->bimg_info = bimg_info;
 				blk->image_len = bimg_len;
 				blk->hole_offset = hole_offset;
-				if (r->version < 15)
+				if (r->version < 10)
+				{
+					/* 9.6 has no BKPIMAGE_APPLY bit: every image is applied */
+					compressed = (bimg_info & 0x02) != 0;
+					blk->apply_image = true;
+				}
+				else if (r->version < 15)
 				{
 					compressed = (bimg_info & 0x02) != 0;
 					blk->apply_image = (bimg_info & 0x04) != 0;

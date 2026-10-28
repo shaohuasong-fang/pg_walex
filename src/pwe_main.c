@@ -1,4 +1,22 @@
 /*
+ * pg_walex - PostgreSQL WAL parsing and recovery tool
+ * Copyright (C) 2026 songshaohua <developerhonor@petalmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
  * pg_walex - command line front end
  */
 #include "pwe_internal.h"
@@ -15,13 +33,13 @@ usage(FILE *out)
 {
 	fprintf(out,
 			"pg_walex " PWE_VERSION " - PostgreSQL WAL Extractor\n"
-			"Read PostgreSQL 11..18 WAL segments directly (no server, no libpq),\n"
+			"Read PostgreSQL 9.6..19 WAL segments directly (no server, no libpq),\n"
 			"reconstruct the changes as portable SQL text and expose a RESTful API.\n\n"
 			"Usage: pg_walex [options] <wal-directory>\n\n"
 			"Options:\n"
 			"  -d, --dir PATH          WAL directory (pg_wal)\n"
 			"  -f, --file PATH         read a single WAL segment file\n"
-			"      --pg-version N      force PostgreSQL major version (11..18)\n"
+			"      --pg-version N      force PostgreSQL major version (9..19)\n"
 			"  -s, --start-lsn LSN     start at LSN (X/Y, inclusive)\n"
 			"  -e, --end-lsn LSN       stop before LSN (X/Y)\n"
 			"  -t, --timeline N        timeline to read (default: highest)\n"
@@ -61,12 +79,14 @@ usage(FILE *out)
 			"      --version           print version and exit\n"
 			"  -h, --help              show this help\n\n"
 			"Examples:\n"
-			"  pg_walex --pg-version version_num waldirectory > changes.sql\n"
-			"  pg_walex -F json --start-lsn 0/16B2C60 waldirectory\n"
-			"  pg_walex --serve --port 8900 --dir waldirectory\n"
-                        "Comments:\n"
-                        " valid version_num is : 11,12,13,14,15,16,17,18\n"
-                        " waldirectory: <pgdata directory>/pg_wal\n");
+			"  pg_walex --pg-version <version number> <wal directory> > changes.sql\n"
+			"  pg_walex -F json --start-lsn 0/16B2C60 <wal directory>\n"
+			"  pg_walex --serve --port 8900 --dir <wal directory>\n"
+			"  pg_walex --serve --monitor --port 8900 --dir <wal directory>\n"
+			"\n"
+			"Comments:\n"
+			" valid <version number>  is : 9,10,11,12,13,14,15,16,17,18,19\n"
+			" valid waldirectory: <data directory>/pg_wal\n");
 }
 
 static int
@@ -144,6 +164,7 @@ main(int argc, char **argv)
 	const char *pgdata_opt = NULL;
 	char		pgdata_guess[4096];
 	bool		no_comments = false;
+	bool		no_connect = false;
 	uint64		limit = 0;
 	uint64		xid_filter = 0;
 	uint64		max_rows = 200000;
@@ -177,7 +198,7 @@ main(int argc, char **argv)
 				{
 					int64		v;
 
-					if (!pwe_parse_int(optarg, &v) || v < 11 || v > 18)
+					if (!pwe_parse_int(optarg, &v) || v < 9 || v > 19)
 					{
 						fprintf(stderr, "pg_walex: invalid PostgreSQL version \"%s\"\n", optarg);
 						return 2;
@@ -322,7 +343,7 @@ main(int argc, char **argv)
 				}
 				break;
 			case 1015:
-				sopts.emit_connect = false;
+				no_connect = true;
 				break;
 			case 1016:
 				warmup = false;
@@ -426,9 +447,14 @@ main(int argc, char **argv)
 	sopts.max_row_cache = (uint32) max_rows;
 	sopts.include_comments = !no_comments;
 	sopts.only_database = db_filter;
-	sopts.emit_connect = true;
+	sopts.emit_connect = !no_connect;
 	sopts.start_lsn = ropts.start_lsn;
-	if (warmup)
+	/*
+	 * Silent warm-up only makes sense for the SQL and stats formats, which
+	 * run the reconstructor and need catalog/row state from earlier WAL.
+	 * json/text print raw records, so they must honour --start-lsn directly.
+	 */
+	if (warmup && (format == 0 || format == 3))
 		ropts.start_lsn = 0;	/* build catalog/row state from the beginning */
 	if (pgdata_opt)
 		sopts.pgdata = pgdata_opt;

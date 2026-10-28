@@ -1,4 +1,22 @@
 /*
+ * pg_walex - PostgreSQL WAL parsing and recovery tool
+ * Copyright (C) 2026 songshaohua <developerhonor@petalmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
  * pg_walex - per-major-version knowledge (page magic, catalog layouts,
  * record type names, built-in type table)
  */
@@ -8,6 +26,8 @@
 #include "pwe_catalog_layouts.h"
 
 static const PweVersionInfo pwe_versions[] = {
+	{9, 0xD093, false},
+	{10, 0xD097, false},
 	{11, 0xD098, false},
 	{12, 0xD101, true},
 	{13, 0xD106, true},
@@ -16,6 +36,7 @@ static const PweVersionInfo pwe_versions[] = {
 	{16, 0xD113, true},
 	{17, 0xD116, true},
 	{18, 0xD118, true},
+	{19, 0xD122, true},
 };
 
 const PweVersionInfo *
@@ -120,7 +141,8 @@ heap2_info_name(uint8 info, int major)
 		case 0x30:
 			return major < 15 ? "CLEANUP_INFO" : "PRUNE_VACUUM_CLEANUP";
 		case 0x40:
-			return "VISIBLE";
+			/* XLOG_HEAP2_VISIBLE was removed in 19 (folded into prune) */
+			return major < 19 ? "VISIBLE" : "UNKNOWN";
 		case 0x50:
 			return "MULTI_INSERT";
 		case 0x60:
@@ -439,9 +461,12 @@ pwe_cat_layout(int cat, int major)
 
 	if (cat < 0 || cat >= PWE_CAT_COUNT)
 		return NULL;
-	for (i = 0; i < 8; i++)
+	/* versions 9, 10, 11..19 in that order; an entry with n == 0 means the
+	 * catalog does not exist yet in that major version (e.g. pg_sequence
+	 * before 10) and is reported as absent. */
+	for (i = 0; i < 11; i++)
 		if (pwe_cat_defs[cat].cols[i].v == major)
-			return &pwe_cat_defs[cat].cols[i];
+			return pwe_cat_defs[cat].cols[i].n > 0 ? &pwe_cat_defs[cat].cols[i] : NULL;
 	return NULL;
 }
 
@@ -649,7 +674,7 @@ pwe_cat_typecodes(int cat, int major)
 
 	if (!tbl)
 		return NULL;
-	if (major < 11 || major > 18)
+	if (major < 9 || major > 19)
 		return NULL;
-	return tbl[major - 11];
+	return tbl[major - 9];
 }

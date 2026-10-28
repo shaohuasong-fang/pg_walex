@@ -1,4 +1,22 @@
 /*
+ * pg_walex - PostgreSQL WAL parsing and recovery tool
+ * Copyright (C) 2026 songshaohua <developerhonor@petalmail.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/*
  * pg_walex - WAL record -> SQL reconstruction engine
  */
 #include "pwe_internal.h"
@@ -1442,7 +1460,8 @@ ensure_begin(PweReconstructor *rc, PweTxn *txn, FILE *out, bool *begun,
 		fprintf(out, "-- pg_walex: type=%s,xid=%u,lsn=%s,timestamp=%s\n",
 				type ? type : "sql", txn->xid, lsnbuf, tsbuf);
 	}
-	fprintf(out, "BEGIN;\n");
+	if (rc->opts.include_comments)
+		fprintf(out, "BEGIN;\n");
 	*begun = true;
 }
 
@@ -3698,7 +3717,8 @@ emit_transaction(PweReconstructor *rc, PweTxn *txn)
 	batch_flush(rc, &pend, &pend_open);
 	if (begun)
 	{
-		fprintf(rc->out, "COMMIT;\n\n");
+		if (rc->opts.include_comments)
+			fprintf(rc->out, "COMMIT;\n\n");
 		if (rc->stats)
 			rc->stats->ntxns++;
 	}
