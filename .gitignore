@@ -1,2 +1,7 @@
 *.o
 /pg_walex
+
+# Build artifacts
+*.o
+*.d
+pg_walex

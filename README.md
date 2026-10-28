@@ -8,7 +8,7 @@
 任何正在运行的实例。通过边解析物理记录边重建系统目录状态，它把堆表变更还原为
 可执行的通用 SQL 文本，也可以通过内置的 RESTful API 提供同样的结果。
 
-支持的 PostgreSQL 大版本：**11 / 12 / 13 / 14 / 15 / 16 / 17 / 18**。
+支持的 PostgreSQL 大版本：**9 / 10 / 11 / 12 / 13 / 14 / 15 / 16 / 17 / 18 / 19**。
 
 典型使用场景：
 
@@ -20,9 +20,7 @@
 ---
 
 ## 1. 功能特性
-
-- **直接访问 WAL**：解析段文件、页头、跨页续写（`contrecord`）、记录头、
-  块引用和主数据。
+- **直接访问 WAL**：解析段文件、页头、跨页续写（`contrecord`）、记录头、 块引用和主数据。
 - **完整的记录解析**：CRC32C 校验；PGLZ / LZ4 / Zstandard 压缩的整页镜像（FPI）
   会被解压。
 - **系统目录重建**：根据 WAL 中出现的 `pg_class`、`pg_attribute`、
@@ -100,8 +98,8 @@ pg_walex: /usr/local/bin/pg_walex
 
 ```bash
 pg_walex --help
-pg_walex 1.1.0 - PostgreSQL WAL Extractor
-Read PostgreSQL 11..18 WAL segments directly (no server, no libpq),
+pg_walex 1.2.0 - PostgreSQL WAL Extractor
+Read PostgreSQL 9.6..19 WAL segments directly (no server, no libpq),
 reconstruct the changes as portable SQL text and expose a RESTful API.
 
 Usage: pg_walex [options] <wal-directory>
@@ -109,7 +107,7 @@ Usage: pg_walex [options] <wal-directory>
 Options:
   -d, --dir PATH          WAL directory (pg_wal)
   -f, --file PATH         read a single WAL segment file
-      --pg-version N      force PostgreSQL major version (11..18)
+      --pg-version N      force PostgreSQL major version (9..19)
   -s, --start-lsn LSN     start at LSN (X/Y, inclusive)
   -e, --end-lsn LSN       stop before LSN (X/Y)
   -t, --timeline N        timeline to read (default: highest)
@@ -150,11 +148,12 @@ Options:
   -h, --help              show this help
 
 Examples:
-  pg_walex --pg-version version_num waldirectory > changes.sql
-  pg_walex -F json --start-lsn 0/16B2C60 waldirectory
-  pg_walex --serve --port 8900 --dir waldirectory
-Comments:
- valid version_num is : 11,12,13,14,15,16,17,18
- waldirectory: <pgdata directory>/pg_wal
-```
+  pg_walex --pg-version <version number> <wal directory> > changes.sql
+  pg_walex -F json --start-lsn 0/16B2C60 <wal directory>
+  pg_walex --serve --port 8900 --dir <wal directory>
+  pg_walex --serve --monitor --port 8900 --dir <wal directory>
 
+Comments:
+ valid <version number>  is : 9,10,11,12,13,14,15,16,17,18,19
+ valid waldirectory: <data directory>/pg_wal
+```
